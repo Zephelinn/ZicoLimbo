@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+#[derive(Clone)]
 pub struct ClientData {
     client_state: Arc<Mutex<ClientState>>,
     packet_stream: Arc<Mutex<PacketStream<TcpStream>>>,

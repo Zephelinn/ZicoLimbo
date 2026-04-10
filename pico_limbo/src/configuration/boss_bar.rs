@@ -27,7 +27,7 @@ pub struct DisabledBossBarConfig {
     enabled: bool,
 }
 
-#[derive(Deserialize, Serialize, Default)]
+#[derive(Deserialize, Serialize, Default, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum BossBarColorConfig {
     #[default]
@@ -40,7 +40,7 @@ pub enum BossBarColorConfig {
     White = 6,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub enum BossBarDivisionConfig {
     #[default]
     NoDivision,

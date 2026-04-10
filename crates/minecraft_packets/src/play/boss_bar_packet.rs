@@ -26,6 +26,48 @@ impl BossBarPacket {
             },
         }
     }
+
+    pub fn add_with_uuid(
+        uuid: Uuid,
+        title: &Component,
+        health: f32,
+        color: BossBarColor,
+        division: BossBarDivision,
+    ) -> Self {
+        Self {
+            uuid: uuid.into(),
+            action: BossBarAction::Add {
+                title: title.clone(),
+                health,
+                color: VarInt::from(color as i32),
+                division: VarInt::from(division as i32),
+                flags: 0,
+            },
+        }
+    }
+
+    pub fn remove(uuid: Uuid) -> Self {
+        Self {
+            uuid: uuid.into(),
+            action: BossBarAction::Remove,
+        }
+    }
+
+    pub fn update_health(uuid: Uuid, health: f32) -> Self {
+        Self {
+            uuid: uuid.into(),
+            action: BossBarAction::UpdateHealth { health },
+        }
+    }
+
+    pub fn update_title(uuid: Uuid, title: &Component) -> Self {
+        Self {
+            uuid: uuid.into(),
+            action: BossBarAction::UpdateTitle {
+                title: title.clone(),
+            },
+        }
+    }
 }
 
 #[allow(dead_code)]

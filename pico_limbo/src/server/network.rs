@@ -1,3 +1,5 @@
+use crate::queue::queue_display::{build_boss_bar_remove_packet, build_display_packets};
+use crate::queue::PushAction;
 use crate::server::client_data::ClientData;
 use crate::server::packet_handler::{PacketHandler, PacketHandlerError};
 use crate::server::packet_registry::{
@@ -9,14 +11,17 @@ use futures::StreamExt;
 use minecraft_packets::login::login_disconnect_packet::LoginDisconnectPacket;
 use minecraft_packets::play::client_bound_keep_alive_packet::ClientBoundKeepAlivePacket;
 use minecraft_packets::play::disconnect_packet::DisconnectPacket;
-use minecraft_protocol::prelude::State;
+use minecraft_packets::play::transfer_packet::TransferPacket;
+use minecraft_protocol::prelude::{State, VarInt};
 use net::packet_stream::PacketStreamError;
 use net::raw_packet::RawPacket;
 use std::num::TryFromIntError;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
 pub struct Server {
@@ -216,22 +221,200 @@ async fn read(
 async fn handle_client(socket: TcpStream, server_state: Arc<RwLock<ServerState>>) {
     let client_data = ClientData::new(socket);
     let mut was_in_play_state = false;
+    // oneshot receiver for queue push signal; set when player enters queue
+    let mut push_rx: Option<oneshot::Receiver<PushAction>> = None;
+    // cancel token for the display refresh task
+    let mut display_cancel_tx: Option<oneshot::Sender<()>> = None;
 
     loop {
-        match read(&client_data, &server_state, &mut was_in_play_state).await {
-            Ok(()) => {}
-            Err(PacketProcessingError::Disconnected) => {
-                debug!("Client disconnected");
-                break;
+        // If we have a push receiver, select on it alongside normal read
+        let push_triggered = if let Some(rx) = push_rx.as_mut() {
+            tokio::select! {
+                read_result = read(&client_data, &server_state, &mut was_in_play_state) => {
+                    match read_result {
+                        Ok(()) => None,
+                        Err(PacketProcessingError::Disconnected) => {
+                            debug!("Client disconnected");
+                            break;
+                        }
+                        Err(PacketProcessingError::Custom(e)) => {
+                            debug!("Error processing packet: {}", e);
+                            None
+                        }
+                        Err(PacketProcessingError::DecodePacketError(version, state, packet_id)) => {
+                            trace!("Unknown packet received: version={version} state={state} packet_id={packet_id}");
+                            None
+                        }
+                    }
+                }
+                push_result = rx => {
+                    match push_result {
+                        Ok(action) => Some(action),
+                        Err(_) => None, // sender dropped
+                    }
+                }
             }
-            Err(PacketProcessingError::Custom(e)) => {
-                debug!("Error processing packet: {}", e);
+        } else {
+            match read(&client_data, &server_state, &mut was_in_play_state).await {
+                Ok(()) => None,
+                Err(PacketProcessingError::Disconnected) => {
+                    debug!("Client disconnected");
+                    break;
+                }
+                Err(PacketProcessingError::Custom(e)) => {
+                    debug!("Error processing packet: {}", e);
+                    None
+                }
+                Err(PacketProcessingError::DecodePacketError(version, state, packet_id)) => {
+                    trace!(
+                        "Unknown packet received: version={version} state={state} packet_id={packet_id}"
+                    );
+                    None
+                }
             }
-            Err(PacketProcessingError::DecodePacketError(version, state, packet_id)) => {
-                trace!(
-                    "Unknown packet received: version={version} state={state} packet_id={packet_id}"
-                );
+        };
+
+        // Check if we just entered Play state and need to enqueue
+        if was_in_play_state && push_rx.is_none() {
+            let queue_state = server_state.read().await.queue_state();
+            if let Some(qs) = queue_state {
+                let (uuid, username) = {
+                    let cs = client_data.client().await;
+                    (cs.get_unique_id(), cs.get_username())
+                };
+                let (tx, rx) = oneshot::channel::<PushAction>();
+                push_rx = Some(rx);
+                let _position = qs.enqueue(uuid, username, tx).await;
+
+                // Spawn display refresh task
+                let qs_display = Arc::clone(&qs);
+                let client_data_display = client_data.clone();
+                let server_state_display = Arc::clone(&server_state);
+                let refresh_interval =
+                    Duration::from_secs(qs.settings.refresh_interval_seconds);
+                let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+                display_cancel_tx = Some(cancel_tx);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(refresh_interval) => {}
+                            _ = &mut cancel_rx => { break; }
+                        }
+
+                        let position = qs_display.position_of(uuid).await;
+                        let total = qs_display.total().await;
+
+                        if let Some(position) = position {
+                            let (protocol_version, boss_bar_uuid) = {
+                                let cs = client_data_display.client().await;
+                                (cs.protocol_version(), cs.boss_bar_uuid())
+                            };
+                            let queue_config = {
+                                let ss = server_state_display.read().await;
+                                ss.queue_config().cloned()
+                            };
+                            if let Some(ref cfg) = queue_config {
+                                let username_str = qs_display
+                                    .username_of(uuid)
+                                    .await
+                                    .unwrap_or_default();
+                                let packets = build_display_packets(
+                                    cfg,
+                                    position,
+                                    total,
+                                    &username_str,
+                                    protocol_version,
+                                    boss_bar_uuid,
+                                );
+                                for raw in packets {
+                                    if client_data_display.write_packet(raw).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
+        }
+
+        // Handle push action
+        if let Some(action) = push_triggered {
+            // Cancel display task
+            if let Some(tx) = display_cancel_tx.take() {
+                let _ = tx.send(());
+            }
+
+            // Send boss bar remove
+            {
+                let queue_state = server_state.read().await.queue_state();
+                if let Some(_qs) = queue_state {
+                    let (protocol_version, boss_bar_uuid) = {
+                        let cs = client_data.client().await;
+                        (cs.protocol_version(), cs.boss_bar_uuid())
+                    };
+                    let queue_config = server_state.read().await.queue_config().cloned();
+                    if let Some(ref cfg) = queue_config {
+                        if let Some(raw) = build_boss_bar_remove_packet(cfg, boss_bar_uuid, protocol_version) {
+                            let _ = client_data.write_packet(raw).await;
+                        }
+                    }
+                }
+            }
+
+            // Dequeue from state
+            {
+                let queue_state = server_state.read().await.queue_state();
+                if let Some(qs) = queue_state {
+                    let uuid = client_data.client().await.get_unique_id();
+                    qs.dequeue(uuid).await;
+                }
+            }
+
+            match action {
+                PushAction::Kick(msg) => {
+                    let _ = kick_client(&client_data, msg).await;
+                }
+                PushAction::Transfer { host, port } => {
+                    let (protocol_version, supports_transfer) = {
+                        let cs = client_data.client().await;
+                        let pv = cs.protocol_version();
+                        let supports = pv.is_after_inclusive(
+                            minecraft_protocol::prelude::ProtocolVersion::V1_20_5,
+                        );
+                        (pv, supports)
+                    };
+                    if supports_transfer {
+                        let packet = TransferPacket::new(&host, &VarInt::from(port));
+                        if let Ok(raw) =
+                            PacketRegistry::Transfer(packet).encode_packet(protocol_version)
+                        {
+                            let _ = client_data.write_packet(raw).await;
+                        }
+                    } else {
+                        let _ = kick_client(
+                            &client_data,
+                            "You have been moved to the main server.".to_string(),
+                        )
+                        .await;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // Cancel display task on any exit
+    if let Some(tx) = display_cancel_tx.take() {
+        let _ = tx.send(());
+    }
+
+    // Dequeue on disconnect
+    {
+        let queue_state = server_state.read().await.queue_state();
+        if let Some(qs) = queue_state {
+            let uuid = client_data.client().await.get_unique_id();
+            qs.dequeue(uuid).await;
         }
     }
 

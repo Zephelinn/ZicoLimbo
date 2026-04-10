@@ -23,6 +23,7 @@ impl Default for ClientState {
             is_flight_allowed: false,
             is_flying: false,
             flying_speed: 0.05,
+            boss_bar_uuid: Uuid::new_v4(),
         }
     }
 }
@@ -38,6 +39,7 @@ pub struct ClientState {
     is_flight_allowed: bool,
     is_flying: bool,
     flying_speed: f32,
+    boss_bar_uuid: Uuid,
 }
 
 impl ClientState {
@@ -117,6 +119,10 @@ impl ClientState {
     pub fn get_unique_id(&self) -> Uuid {
         self.game_profile()
             .map_or_else(Uuid::default, |profile| profile.uuid())
+    }
+
+    pub const fn boss_bar_uuid(&self) -> Uuid {
+        self.boss_bar_uuid
     }
 
     pub fn get_textures(&self) -> Option<Property> {

@@ -1,5 +1,7 @@
 use crate::configuration::boss_bar::EnabledBossBarConfig;
 use crate::configuration::commands::CommandsConfig;
+use crate::configuration::queue::QueueConfig;
+use crate::queue::QueueState;
 use crate::server::game_mode::GameMode;
 use base64::engine::general_purpose;
 use base64::{Engine, alphabet, engine};
@@ -111,6 +113,8 @@ pub struct ServerState {
     allow_unsupported_versions: bool,
     allow_flight: bool,
     server_commands: ServerCommands,
+    queue_state: Option<Arc<QueueState>>,
+    queue_config: Option<QueueConfig>,
 }
 
 impl ServerState {
@@ -269,6 +273,14 @@ impl ServerState {
     pub fn decrement(&self) {
         self.connected_clients.fetch_sub(1, Ordering::SeqCst);
     }
+
+    pub fn queue_state(&self) -> Option<Arc<QueueState>> {
+        self.queue_state.clone()
+    }
+
+    pub fn queue_config(&self) -> Option<&QueueConfig> {
+        self.queue_config.as_ref()
+    }
 }
 
 #[derive(Default)]
@@ -303,6 +315,8 @@ pub struct ServerStateBuilder {
     allow_flight: bool,
     accept_transfers: bool,
     server_commands: ServerCommands,
+    queue_state: Option<Arc<QueueState>>,
+    queue_config: Option<QueueConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -574,6 +588,16 @@ impl ServerStateBuilder {
         self
     }
 
+    pub fn queue_state(&mut self, queue_state: Arc<QueueState>) -> &mut Self {
+        self.queue_state = Some(queue_state);
+        self
+    }
+
+    pub fn set_queue_config(&mut self, config: QueueConfig) -> &mut Self {
+        self.queue_config = Some(config);
+        self
+    }
+
     /// Finish building, returning an error if any required fields are missing.
     pub fn build(self) -> Result<ServerState, ServerStateBuilderError> {
         let world = if self.schematic_file_path.is_empty() {
@@ -619,6 +643,8 @@ impl ServerStateBuilder {
             allow_flight: self.allow_flight,
             accept_transfers: self.accept_transfers,
             server_commands: self.server_commands,
+            queue_state: self.queue_state,
+            queue_config: self.queue_config,
         })
     }
 }

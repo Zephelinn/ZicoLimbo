@@ -4,10 +4,13 @@ use crate::configuration::config::{Config, ConfigError, load_or_create};
 use crate::configuration::tab_list::TabListMode;
 use crate::configuration::title::TitleConfig;
 use crate::configuration::world_config::boundaries::BoundariesConfig;
+use crate::queue::QueueState;
 use crate::server::network::Server;
 use crate::server_state::{ServerState, ServerStateBuilderError};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -21,7 +24,24 @@ pub async fn start_server(config_path: PathBuf, logging_level: u8) -> ExitCode {
 
     let bind = cfg.bind.clone();
 
-    match build_state(cfg) {
+    // Spawn the push loop before building the server state, so we have the Arc
+    let queue_state = if cfg.queue.enabled {
+        let qs = Arc::new(QueueState::from_config(&cfg.queue));
+        let push_interval = Duration::from_secs(cfg.queue.push_interval_seconds);
+        let push_count = cfg.queue.push_count;
+        let qs_clone = Arc::clone(&qs);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(push_interval).await;
+                qs_clone.push_next(push_count).await;
+            }
+        });
+        Some(qs)
+    } else {
+        None
+    };
+
+    match build_state(cfg, queue_state) {
         Ok(server_state) => {
             Server::new(&bind, server_state).run().await;
             ExitCode::SUCCESS
@@ -53,7 +73,10 @@ fn load_configuration(config_path: &PathBuf) -> Option<Config> {
     None
 }
 
-fn build_state(cfg: Config) -> Result<ServerState, ServerStateBuilderError> {
+fn build_state(
+    cfg: Config,
+    queue_state: Option<Arc<QueueState>>,
+) -> Result<ServerState, ServerStateBuilderError> {
     let mut server_state_builder = ServerState::builder();
 
     let forwarding: TaggedForwarding = cfg.forwarding.into();
@@ -129,6 +152,11 @@ fn build_state(cfg: Config) -> Result<ServerState, ServerStateBuilderError> {
         .set_allow_flight(cfg.allow_flight)
         .set_accept_transfers(cfg.accept_transfers)
         .server_commands(cfg.commands);
+
+    if let Some(qs) = queue_state {
+        server_state_builder.queue_state(qs);
+        server_state_builder.set_queue_config(cfg.queue);
+    }
 
     server_state_builder.build()
 }
