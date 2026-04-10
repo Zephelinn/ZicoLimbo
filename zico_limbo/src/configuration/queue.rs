@@ -59,8 +59,10 @@ pub enum QueueTabListConfig {
 pub struct EnabledQueueTabListConfig {
     #[serde(deserialize_with = "require_true")]
     pub enabled: bool,
-    pub header: String,
-    pub footer: String,
+    /// Each entry is one line. Lines are joined with "\n" before MiniMessage parsing.
+    pub header: Vec<String>,
+    /// Each entry is one line. Lines are joined with "\n" before MiniMessage parsing.
+    pub footer: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -73,8 +75,17 @@ impl Default for QueueTabListConfig {
     fn default() -> Self {
         Self::Enabled(EnabledQueueTabListConfig {
             enabled: true,
-            header: "<bold>Queue</bold>".to_string(),
-            footer: "Position: {position}/{total}".to_string(),
+            header: vec![
+                "".to_string(),
+                "<bold><aqua>Queue Server</aqua></bold>".to_string(),
+                "".to_string(),
+            ],
+            footer: vec![
+                "".to_string(),
+                "<yellow>Position: {position}/{total}</yellow>".to_string(),
+                "<gray>ETA: {eta}s</gray>".to_string(),
+                "".to_string(),
+            ],
         })
     }
 }

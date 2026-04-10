@@ -1,4 +1,6 @@
-use crate::queue::queue_display::{build_boss_bar_remove_packet, build_display_packets};
+use crate::queue::queue_display::{
+    build_action_bar_packet, build_boss_bar_remove_packet, build_display_packets,
+};
 use crate::queue::PushAction;
 use crate::server::client_data::ClientData;
 use crate::server::packet_handler::{PacketHandler, PacketHandlerError};
@@ -292,46 +294,69 @@ async fn handle_client(socket: TcpStream, server_state: Arc<RwLock<ServerState>>
                 let server_state_display = Arc::clone(&server_state);
                 let refresh_interval =
                     Duration::from_secs(qs.settings.refresh_interval_seconds);
+                // Action bar must be resent every ~1s or it fades out client-side
+                let action_bar_interval = Duration::from_secs(1);
                 let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
                 display_cancel_tx = Some(cancel_tx);
                 tokio::spawn(async move {
+                    let mut boss_bar_initialized = false;
+                    let mut refresh_deadline =
+                        tokio::time::Instant::now() + refresh_interval;
                     loop {
+                        // Sleep until next action-bar tick or full-refresh, whichever is sooner
+                        let action_bar_sleep = tokio::time::sleep(action_bar_interval);
                         tokio::select! {
-                            _ = tokio::time::sleep(refresh_interval) => {}
+                            _ = action_bar_sleep => {}
                             _ = &mut cancel_rx => { break; }
                         }
 
                         let position = qs_display.position_of(uuid).await;
                         let total = qs_display.total().await;
+                        let Some(position) = position else { continue };
 
-                        if let Some(position) = position {
-                            let (protocol_version, boss_bar_uuid) = {
-                                let cs = client_data_display.client().await;
-                                (cs.protocol_version(), cs.boss_bar_uuid())
-                            };
-                            let queue_config = {
-                                let ss = server_state_display.read().await;
-                                ss.queue_config().cloned()
-                            };
-                            if let Some(ref cfg) = queue_config {
-                                let username_str = qs_display
-                                    .username_of(uuid)
-                                    .await
-                                    .unwrap_or_default();
-                                let packets = build_display_packets(
-                                    cfg,
-                                    position,
-                                    total,
-                                    &username_str,
-                                    protocol_version,
-                                    boss_bar_uuid,
-                                );
-                                for raw in packets {
-                                    if client_data_display.write_packet(raw).await.is_err() {
-                                        return;
-                                    }
+                        let (protocol_version, boss_bar_uuid) = {
+                            let cs = client_data_display.client().await;
+                            (cs.protocol_version(), cs.boss_bar_uuid())
+                        };
+                        let queue_config = {
+                            let ss = server_state_display.read().await;
+                            ss.queue_config().cloned()
+                        };
+                        let Some(ref cfg) = queue_config else { continue };
+                        let username_str = qs_display.username_of(uuid).await.unwrap_or_default();
+
+                        // Always resend action bar to prevent it from fading
+                        if let Some(raw) = build_action_bar_packet(
+                            cfg,
+                            position,
+                            total,
+                            &username_str,
+                            protocol_version,
+                        ) {
+                            if client_data_display.write_packet(raw).await.is_err() {
+                                return;
+                            }
+                        }
+
+                        // Full refresh (tab list, title, boss bar) on the slower interval
+                        if tokio::time::Instant::now() >= refresh_deadline {
+                            refresh_deadline =
+                                tokio::time::Instant::now() + refresh_interval;
+                            let packets = build_display_packets(
+                                cfg,
+                                position,
+                                total,
+                                &username_str,
+                                protocol_version,
+                                boss_bar_uuid,
+                                boss_bar_initialized,
+                            );
+                            for raw in packets {
+                                if client_data_display.write_packet(raw).await.is_err() {
+                                    return;
                                 }
                             }
+                            boss_bar_initialized = true;
                         }
                     }
                 });

@@ -17,6 +17,42 @@ fn encode(packet: PacketRegistry, protocol_version: ProtocolVersion) -> Option<R
     packet.encode_packet(protocol_version).ok()
 }
 
+/// Build packets to send on every action-bar tick (every ~1s).
+/// Only includes the action bar packet.
+pub fn build_action_bar_packet(
+    config: &QueueConfig,
+    position: usize,
+    total: usize,
+    username: &str,
+    protocol_version: ProtocolVersion,
+) -> Option<RawPacket> {
+    if !protocol_version.is_after_inclusive(ProtocolVersion::V1_8) {
+        return None;
+    }
+    let QueueActionBarConfig::Enabled(ref ab_cfg) = config.action_bar else {
+        return None;
+    };
+    let push_interval = config.push_interval_seconds;
+    let push_count = config.push_count;
+    let text = apply_placeholders(&ab_cfg.text, position, total, username, push_interval, push_count);
+    let comp = parse_mini_message(&text).ok()?;
+    if protocol_version.is_after_inclusive(ProtocolVersion::V1_17) {
+        let pkt = SetActionBarTextPacket::new(&comp);
+        encode(PacketRegistry::SetActionBarText(pkt), protocol_version)
+    } else if protocol_version.is_after_inclusive(ProtocolVersion::V1_11) {
+        use minecraft_packets::play::legacy_set_title_packet::LegacySetTitlePacket;
+        let pkt = LegacySetTitlePacket::action_bar(&comp);
+        encode(PacketRegistry::LegacySetTitle(pkt), protocol_version)
+    } else {
+        use minecraft_packets::play::legacy_chat_message_packet::LegacyChatMessagePacket;
+        let pkt = LegacyChatMessagePacket::game_info(&comp);
+        encode(PacketRegistry::LegacyChatMessage(pkt), protocol_version)
+    }
+}
+
+/// Build packets sent on each full refresh tick (tab list, title, boss bar).
+/// `boss_bar_initialized` should be `false` on the very first call so the boss bar
+/// is added; `true` on subsequent calls so only update packets are sent (no flicker).
 pub fn build_display_packets(
     config: &QueueConfig,
     position: usize,
@@ -24,6 +60,7 @@ pub fn build_display_packets(
     username: &str,
     protocol_version: ProtocolVersion,
     boss_bar_uuid: Uuid,
+    boss_bar_initialized: bool,
 ) -> Vec<RawPacket> {
     let mut packets = Vec::new();
 
@@ -32,10 +69,12 @@ pub fn build_display_packets(
 
     // Tab list
     if let QueueTabListConfig::Enabled(ref tab_cfg) = config.tab_list {
+        let raw_header = tab_cfg.header.join("\n");
+        let raw_footer = tab_cfg.footer.join("\n");
         let header_text =
-            apply_placeholders(&tab_cfg.header, position, total, username, push_interval, push_count);
+            apply_placeholders(&raw_header, position, total, username, push_interval, push_count);
         let footer_text =
-            apply_placeholders(&tab_cfg.footer, position, total, username, push_interval, push_count);
+            apply_placeholders(&raw_footer, position, total, username, push_interval, push_count);
         if let (Ok(header), Ok(footer)) = (
             parse_mini_message(&header_text),
             parse_mini_message(&footer_text),
@@ -122,47 +161,7 @@ pub fn build_display_packets(
         }
     }
 
-    // Action bar (1.8+)
-    if protocol_version.is_after_inclusive(ProtocolVersion::V1_8) {
-        if let QueueActionBarConfig::Enabled(ref ab_cfg) = config.action_bar {
-            let text = apply_placeholders(
-                &ab_cfg.text,
-                position,
-                total,
-                username,
-                push_interval,
-                push_count,
-            );
-            if let Ok(comp) = parse_mini_message(&text) {
-                if protocol_version.is_after_inclusive(ProtocolVersion::V1_17) {
-                    let pkt = SetActionBarTextPacket::new(&comp);
-                    if let Some(raw) =
-                        encode(PacketRegistry::SetActionBarText(pkt), protocol_version)
-                    {
-                        packets.push(raw);
-                    }
-                } else if protocol_version.is_after_inclusive(ProtocolVersion::V1_11) {
-                    use minecraft_packets::play::legacy_set_title_packet::LegacySetTitlePacket;
-                    let pkt = LegacySetTitlePacket::action_bar(&comp);
-                    if let Some(raw) =
-                        encode(PacketRegistry::LegacySetTitle(pkt), protocol_version)
-                    {
-                        packets.push(raw);
-                    }
-                } else {
-                    use minecraft_packets::play::legacy_chat_message_packet::LegacyChatMessagePacket;
-                    let pkt = LegacyChatMessagePacket::game_info(&comp);
-                    if let Some(raw) =
-                        encode(PacketRegistry::LegacyChatMessage(pkt), protocol_version)
-                    {
-                        packets.push(raw);
-                    }
-                }
-            }
-        }
-    }
-
-    // Boss bar (1.9+)
+    // Boss bar (1.9+) — add once, then use update packets to avoid flicker
     if protocol_version.is_after_inclusive(ProtocolVersion::V1_9) {
         if let QueueBossBarConfig::Enabled(ref bb_cfg) = config.boss_bar {
             let title_text = apply_placeholders(
@@ -173,7 +172,7 @@ pub fn build_display_packets(
                 push_interval,
                 push_count,
             );
-            // health = 1.0 - (position - 1) / total (drains as you move up the queue)
+            // health drains as you move up the queue
             let health = if total == 0 {
                 1.0_f32
             } else {
@@ -182,15 +181,34 @@ pub fn build_display_packets(
             if let Ok(comp) = parse_mini_message(&title_text) {
                 let color: BossBarColor = bb_cfg.color.into();
                 let division: BossBarDivision = bb_cfg.division.into();
-                // First remove, then re-add with updated info
-                let remove_pkt = BossBarPacket::remove(boss_bar_uuid);
-                if let Some(raw) = encode(PacketRegistry::BossBar(remove_pkt), protocol_version) {
-                    packets.push(raw);
-                }
-                let add_pkt =
-                    BossBarPacket::add_with_uuid(boss_bar_uuid, &comp, health, color, division);
-                if let Some(raw) = encode(PacketRegistry::BossBar(add_pkt), protocol_version) {
-                    packets.push(raw);
+                if !boss_bar_initialized {
+                    // First time: send Add
+                    let add_pkt = BossBarPacket::add_with_uuid(
+                        boss_bar_uuid,
+                        &comp,
+                        health,
+                        color,
+                        division,
+                    );
+                    if let Some(raw) =
+                        encode(PacketRegistry::BossBar(add_pkt), protocol_version)
+                    {
+                        packets.push(raw);
+                    }
+                } else {
+                    // Subsequent refreshes: update title and health in-place (no flicker)
+                    let update_title = BossBarPacket::update_title(boss_bar_uuid, &comp);
+                    if let Some(raw) =
+                        encode(PacketRegistry::BossBar(update_title), protocol_version)
+                    {
+                        packets.push(raw);
+                    }
+                    let update_health = BossBarPacket::update_health(boss_bar_uuid, health);
+                    if let Some(raw) =
+                        encode(PacketRegistry::BossBar(update_health), protocol_version)
+                    {
+                        packets.push(raw);
+                    }
                 }
             }
         }
