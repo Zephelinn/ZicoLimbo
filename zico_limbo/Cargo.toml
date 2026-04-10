@@ -1,15 +1,15 @@
 [package]
-name = "pico_limbo"
+name = "zico_limbo"
 version = "1.12.1+mc26.1.1"
 edition = "2024"
 
 [lib]
-name = "pico_limbo_lib"
+name = "zico_limbo_lib"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [[bin]]
-name = "pico_limbo"
+name = "zico_limbo"
 path = "src/main.rs"
 
 [dependencies]

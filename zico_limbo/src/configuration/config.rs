@@ -87,8 +87,8 @@ impl Default for Config {
         Self {
             bind: "0.0.0.0:25565".into(),
             server_list: ServerListConfig::default(),
-            welcome_message: "Welcome to PicoLimbo!".into(),
-            action_bar: "Welcome to PicoLimbo!".into(),
+            welcome_message: "Welcome to ZicoLimbo!".into(),
+            action_bar: "Welcome to ZicoLimbo!".into(),
             forwarding: ForwardingConfig::default(),
             default_game_mode: GameModeConfig::default(),
             world: WorldConfig::default(),
