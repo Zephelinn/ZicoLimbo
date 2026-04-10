@@ -300,63 +300,66 @@ async fn handle_client(socket: TcpStream, server_state: Arc<RwLock<ServerState>>
                 display_cancel_tx = Some(cancel_tx);
                 tokio::spawn(async move {
                     let mut boss_bar_initialized = false;
-                    let mut refresh_deadline =
-                        tokio::time::Instant::now() + refresh_interval;
-                    loop {
-                        // Sleep until next action-bar tick or full-refresh, whichever is sooner
-                        let action_bar_sleep = tokio::time::sleep(action_bar_interval);
-                        tokio::select! {
-                            _ = action_bar_sleep => {}
-                            _ = &mut cancel_rx => { break; }
-                        }
+                    // Set deadline in the past so the first iteration triggers a full refresh
+                    let mut refresh_deadline = tokio::time::Instant::now();
 
+                    loop {
                         let position = qs_display.position_of(uuid).await;
                         let total = qs_display.total().await;
-                        let Some(position) = position else { continue };
 
-                        let (protocol_version, boss_bar_uuid) = {
-                            let cs = client_data_display.client().await;
-                            (cs.protocol_version(), cs.boss_bar_uuid())
-                        };
-                        let queue_config = {
-                            let ss = server_state_display.read().await;
-                            ss.queue_config().cloned()
-                        };
-                        let Some(ref cfg) = queue_config else { continue };
-                        let username_str = qs_display.username_of(uuid).await.unwrap_or_default();
+                        if let Some(position) = position {
+                            let (protocol_version, boss_bar_uuid) = {
+                                let cs = client_data_display.client().await;
+                                (cs.protocol_version(), cs.boss_bar_uuid())
+                            };
+                            let queue_config = {
+                                let ss = server_state_display.read().await;
+                                ss.queue_config().cloned()
+                            };
+                            if let Some(ref cfg) = queue_config {
+                                let username_str =
+                                    qs_display.username_of(uuid).await.unwrap_or_default();
 
-                        // Always resend action bar to prevent it from fading
-                        if let Some(raw) = build_action_bar_packet(
-                            cfg,
-                            position,
-                            total,
-                            &username_str,
-                            protocol_version,
-                        ) {
-                            if client_data_display.write_packet(raw).await.is_err() {
-                                return;
+                                // Always resend action bar to prevent it from fading
+                                if let Some(raw) = build_action_bar_packet(
+                                    cfg,
+                                    position,
+                                    total,
+                                    &username_str,
+                                    protocol_version,
+                                ) {
+                                    if client_data_display.write_packet(raw).await.is_err() {
+                                        return;
+                                    }
+                                }
+
+                                // Full refresh (tab list, title, boss bar) on the slower interval
+                                if tokio::time::Instant::now() >= refresh_deadline {
+                                    refresh_deadline =
+                                        tokio::time::Instant::now() + refresh_interval;
+                                    let packets = build_display_packets(
+                                        cfg,
+                                        position,
+                                        total,
+                                        &username_str,
+                                        protocol_version,
+                                        boss_bar_uuid,
+                                        boss_bar_initialized,
+                                    );
+                                    for raw in packets {
+                                        if client_data_display.write_packet(raw).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    boss_bar_initialized = true;
+                                }
                             }
                         }
 
-                        // Full refresh (tab list, title, boss bar) on the slower interval
-                        if tokio::time::Instant::now() >= refresh_deadline {
-                            refresh_deadline =
-                                tokio::time::Instant::now() + refresh_interval;
-                            let packets = build_display_packets(
-                                cfg,
-                                position,
-                                total,
-                                &username_str,
-                                protocol_version,
-                                boss_bar_uuid,
-                                boss_bar_initialized,
-                            );
-                            for raw in packets {
-                                if client_data_display.write_packet(raw).await.is_err() {
-                                    return;
-                                }
-                            }
-                            boss_bar_initialized = true;
+                        // Sleep until next action-bar tick
+                        tokio::select! {
+                            _ = tokio::time::sleep(action_bar_interval) => {}
+                            _ = &mut cancel_rx => { break; }
                         }
                     }
                 });
